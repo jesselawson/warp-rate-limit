@@ -1,0 +1,22 @@
+[package]
+name = "warp-rate-limit"
+version = "0.1.0"
+edition = "2021"
+description = "Rate limiting middleware for the Warp web framework"
+authors = ["Jesse Lawson <jesse@lawsonry.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jesselawson/warp-rate-limit"
+documentation = "https://docs.rs/warp-rate-limit"
+readme = "README.md"
+keywords = ["warp", "rate-limit", "middleware", "web", "async"]
+categories = ["web-programming", "asynchronous"]
+
+[dependencies]
+warp = "0.3"
+tokio = { version = "1.0", features = ["full"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tracing-subscriber = "0.3"
+serde_json = "1.0"
