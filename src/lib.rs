@@ -65,10 +65,10 @@ impl Default for RateLimitConfig {
 }
 
 #[derive(Debug)]
-struct RateLimitData {
-    requests: Vec<Instant>,
-    window_size: Duration,
-    max_requests: usize,
+pub struct RateLimitData {
+    pub requests: Vec<Instant>,
+    pub window_size: Duration,
+    pub max_requests: usize,
 }
 
 impl RateLimitData {
@@ -79,6 +79,8 @@ impl RateLimitData {
             max_requests: config.max_requests,
         }
     }
+
+    
 
     fn is_rate_limited(&mut self, now: Instant) -> bool {
         self.requests.retain(|&time| now - time <= self.window_size);
@@ -205,7 +207,7 @@ impl RateLimit {
     /// use warp_rate_limit::RateLimit;
     /// let rate_limit = RateLimit::new().into_filter();
     /// ```
-    pub fn into_filter(self) -> BoxedFilter<((),)> {
+    pub fn into_filter(self) -> BoxedFilter<(RateLimitData,)> {
         let rate_limiter = self;
 
         warp::any()
@@ -220,13 +222,20 @@ impl RateLimit {
                     .entry(ip)
                     .or_insert_with(|| RateLimitData::new(&rate_limiter.config));
 
-                if rate_limit_data.is_rate_limited(now) {
-                    return Err(warp::reject::custom(RateLimitError::LimitExceeded));
-                }
+                    if rate_limit_data.is_rate_limited(now) {
+                        return Err(warp::reject::custom(RateLimitError::LimitExceeded));
+                    }
 
-                Ok::<_, Rejection>(())
+                    // Create info to pass downstream
+            let info = RateLimitData {
+                max_requests: rate_limit_data.max_requests,
+                requests: rate_limit_data.requests.clone(),
+                window_size: rate_limit_data.window_size
+            };
+
+
+                Ok::<_, Rejection>(info)
             })
-            .map(|()| ())
             .boxed()
     }
 }
