@@ -14,11 +14,19 @@ A rate-limiting middleware for the Warp web framework.
 
 ## Usage
 
+You'll first need to include this crate into your project. 
+
 Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 warp-rate-limit = "0.1"
+```
+
+Or, run:
+
+```zsh
+cargo add warp-rate-limit
 ```
 
 Then, you'll need to:
@@ -38,7 +46,8 @@ async fn main() {
     // 5 requests per every 30 seconds:
     let rate_limit = RateLimit::new()
         .with_window(Duration::from_secs(30))
-        .with_max_requests(5);
+        .with_max_requests(5)
+        .into_filter(); // Don't forget this part!
 
     // STEP 2. Add the rate limiter to a route:
     let route = warp::path("hello")
@@ -49,11 +58,27 @@ async fn main() {
 }
 ```
 
+## Troubleshooting
+
+If you get the following error:
+
+```
+the trait bound `RateLimit: warp::filter::FilterBase` is not satisfied
+```
+
+Then you likely need to add `into_filter()` to your rate limiter. For example:
+
+```
+let public_rate_limit = RateLimit::new().with_max_requests(10).into_filter();
+let partner_rate_limit = RateLimit::new().with_max_requests(200).into_filter();
+```
+
+
 ## Configuration Options
 
 See the [documentation](https://docs.rs/warp-rate-limit).
 
-## Limitations
+## Designed to be Small
 
 For most basic web applications these limitations are acceptable, but if you need more advanced features, consider using a dedicated rate-limiting solution with persistent storage.
 
