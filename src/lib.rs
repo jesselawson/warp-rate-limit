@@ -1,271 +1,210 @@
-//! Rate limiting middleware for Warp web applications.
-//!
-//! This crate provides a flexible rate limiting implementation that can be easily integrated
-//! into Warp-based web services. It supports per-IP rate limiting with configurable time windows
-//! and request limits.
-//!
-//! # Features
-//!
-//! - In memory, IP-based rate limiting
-//! - Configurable time windows and request limits
-//! - Thread-safe request tracking
-//! - Idiomatic integration with existing Warp routes
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+
+//! Rate limiting middleware for Warp
+//! 
+//! This crate provides RFC 6585 compliant rate limiting middleware for Warp web applications.
+//! It supports in-memory rate limiting with configurable windows and limits.
 //!
 
+
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
-use tracing::{debug, warn};
-use warp::filters::BoxedFilter;
+use tokio::sync::RwLock;
 use warp::{Filter, Rejection, Reply};
+use warp::http::header::HeaderValue;
 
-/// Error types for rate limiting operations.
-///
-/// Currently only includes the `LimitExceeded` variant, but may be extended
-/// in future versions to handle additional error cases.
-#[derive(Debug)]
-pub enum RateLimitError {
-    /// Indicates that the client has exceeded their rate limit
-    LimitExceeded,
-}
-
-impl std::fmt::Display for RateLimitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RateLimitError::LimitExceeded => write!(f, "rate limit exceeded"),
-        }
-    }
-}
-
-impl std::error::Error for RateLimitError {}
-impl warp::reject::Reject for RateLimitError {}
-
-/// Configuration options for the rate limiter.
-///
-/// This struct allows customization of the rate limiting behavior through
-/// window size and maximum request count settings. More may be added in
-/// a future version.
-#[derive(Clone, Debug)]
+/// Configuration for the rate limiter
+#[derive(Clone, Debug, PartialEq)]
 pub struct RateLimitConfig {
-    /// Duration of the rate limiting window
-    pub window_size: Duration,
     /// Maximum number of requests allowed within the window
-    pub max_requests: usize,
+    pub max_requests: u32, 
+    /// Time window for rate limiting
+    pub window: Duration,
+    /// Format for Retry-After header (RFC 7231 Date or Seconds)
+    pub retry_after_format: RetryAfterFormat,
 }
 
+/// Sensible (opinionated) defaults
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            window_size: Duration::from_secs(60),
-            max_requests: 100,
+            max_requests: 60, // 60 req/min baseline 
+            window: Duration::from_secs(60),
+            retry_after_format: RetryAfterFormat::HttpDate,
         }
     }
 }
 
-#[derive(Debug)]
-pub struct RateLimitData {
-    pub requests: Vec<Instant>,
-    pub window_size: Duration,
-    pub max_requests: usize,
-}
-
-impl RateLimitData {
-    fn new(config: &RateLimitConfig) -> Self {
+/// Factory methods for quickly building a rate limiter
+impl RateLimitConfig {
+    /// Build a `RateLimitConfig` with sensible defaults. In this 
+    /// case, will rate-limit based on provided `max` requests 
+    /// per minute (60 Earth seconds).
+    /// ```rust
+    /// use std::time::Duration;
+    /// use warp_rate_limit::RateLimitConfig;
+    /// let x = RateLimitConfig {
+    ///     max_requests: 45,
+    ///     window: Duration::from_secs(60),
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(x, RateLimitConfig::max_per_minute(45))
+    /// ```
+    pub fn max_per_minute(max: u32) -> Self {
         Self {
-            requests: Vec::new(),
-            window_size: config.window_size,
-            max_requests: config.max_requests,
+            max_requests: max,
+            window: Duration::from_secs(60),
+            ..Default::default()
         }
     }
 
-    
-
-    fn is_rate_limited(&mut self, now: Instant) -> bool {
-        self.requests.retain(|&time| now - time <= self.window_size);
-
-        if self.requests.len() >= self.max_requests {
-            warn!("Rate limit exceeded. Current requests: {}", self.requests.len());
-            return true;
+    /// A quick way to build a RateLimitConfig:
+    /// ```rust
+    /// use std::time::Duration;
+    /// use warp_rate_limit::RateLimitConfig;
+    /// let x = RateLimitConfig {
+    ///     max_requests: 50,
+    ///     window: Duration::from_secs(60),
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(x, RateLimitConfig::max_per_window(50,60))
+    /// ```
+    pub fn max_per_window(max_requests: u32, window_seconds:u64) -> Self {
+        Self {
+            max_requests: max_requests,
+            window: Duration::from_secs(window_seconds),
+            ..Default::default()
         }
-
-        self.requests.push(now);
-        debug!("Request accepted. Current requests: {}", self.requests.len());
-        false
     }
 }
 
-/// The main rate limiter implementation.
-///
-/// `RateLimit` maintains a thread-safe state of request counts per IP address
-/// and provides methods to configure and apply rate limiting to Warp routes.
-/// The internal state is protected by a `tokio::sync::Mutex` and wrapped in an `Arc`,
-/// making it safe to share across multiple threads in an async context.
+/// Format options for the Retry-After header
+#[derive(Clone, Debug, PartialEq)]
+pub enum RetryAfterFormat {
+    /// HTTP-date format (RFC 7231)
+    HttpDate,
+    /// Number of seconds
+    Seconds,
+}
+
+/// Custom rejection type for rate limiting
+#[derive(Debug)]
+pub struct RateLimitRejection {
+    /// Duration until the client can retry
+    pub retry_after: Duration,
+    /// Maximum requests allowed in the window
+    pub limit: u32,
+    /// Unix timestamp when the rate limit resets
+    pub reset_time: DateTime<Utc>,
+    /// Format to use for Retry-After header
+    pub retry_after_format: RetryAfterFormat,
+}
+
+impl warp::reject::Reject for RateLimitRejection {}
+
+/// State for tracking rate limits
 #[derive(Clone)]
-pub struct RateLimit {
-    state: Arc<Mutex<HashMap<IpAddr, RateLimitData>>>,
+struct RateLimiter {
+    state: Arc<RwLock<HashMap<String, (Instant, u32)>>>,
     config: RateLimitConfig,
 }
 
-impl RateLimit {
-    /// Creates a new rate limiter with default configuration.
-    ///
-    /// Default configuration allows 100 requests per minute.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use warp_rate_limit::RateLimit;
-    ///
-    /// let rate_limiter = RateLimit::new();
-    /// ```
-    pub fn new() -> Self {
-        Self::with_config(RateLimitConfig::default())
-    }
-
-    /// Creates a new rate limiter with custom configuration.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use warp_rate_limit::{RateLimit, RateLimitConfig};
-    /// use std::time::Duration;
-    ///
-    /// let config = RateLimitConfig {
-    ///     window_size: Duration::from_secs(30),
-    ///     max_requests: 50,
-    /// };
-    /// let rate_limiter = RateLimit::with_config(config);
-    /// ```
-    pub fn with_config(config: RateLimitConfig) -> Self {
+impl RateLimiter {
+    /// Creates a new rate limiter with the given configuration
+    fn new(config: RateLimitConfig) -> Self {
         Self {
-            state: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(RwLock::new(HashMap::new())),
             config,
         }
     }
 
-    /// Sets the time window for rate limiting.
-    ///
-    /// # Arguments
-    ///
-    /// * `window` - The duration of the rate limiting window
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use warp_rate_limit::RateLimit;
-    /// use std::time::Duration;
-    ///
-    /// let rate_limiter = RateLimit::new()
-    ///     .with_window(Duration::from_secs(30));
-    /// ```
-    pub fn with_window(mut self, window: Duration) -> Self {
-        self.config.window_size = window;
-        self
-    }
+    /// Checks if a request should be rate limited
+    async fn check_rate_limit(&self, key: &str) -> Result<u32, Rejection> {
+        let mut state = self.state.write().await;
+        let now = Instant::now();
+        let current = state.get(key).copied();
 
-    /// Sets the maximum number of requests allowed within the window.
-    ///
-    /// # Arguments
-    ///
-    /// * `max_requests` - Maximum number of requests allowed
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use warp_rate_limit::RateLimit;
-    /// let rate_limiter = RateLimit::new()
-    ///     .with_max_requests(50);
-    /// ```
-    pub fn with_max_requests(mut self, max_requests: usize) -> Self {
-        self.config.max_requests = max_requests;
-        self
-    }
+        match current {
+            Some((last_request, count)) => {
+                if now.duration_since(last_request) > self.config.window {
+                    // Window has passed, reset counter
+                    state.insert(key.to_string(), (now, 1));
+                    Ok(self.config.max_requests - 1)
+                } else if count >= self.config.max_requests {
+                    // Rate limit exceeded
+                    let retry_after = self.config.window - now.duration_since(last_request);
+                    let reset_time = Utc::now() + ChronoDuration::from_std(retry_after).unwrap();
 
-    /// Converts the rate limiter into a Warp filter.
-    ///
-    /// This method creates a Warp filter that can be composed with other filters
-    /// to add rate limiting to a route.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use warp::Filter;
-    /// use warp_rate_limit::RateLimit;
-    ///
-    /// let rate_limiter = RateLimit::new();
-    ///
-    /// let route = warp::path!("api" / "endpoint")
-    ///     .and(rate_limiter.into_filter())
-    ///     .map(|_| "Hello, World!");
-    /// ```
-    ///
-    /// Below is an example with defaults (100 requests per 60 seconds):
-    ///
-    /// ```rust
-    /// use warp_rate_limit::RateLimit;
-    /// let rate_limit = RateLimit::new().into_filter();
-    /// ```
-    pub fn into_filter(self) -> BoxedFilter<(RateLimitData,)> {
-        let rate_limiter = self;
-
-        warp::any()
-            .map(move || rate_limiter.clone())
-            .and(warp::filters::addr::remote())
-            .and_then(|rate_limiter: RateLimit, addr: Option<std::net::SocketAddr>| async move {
-                let ip = addr.map(|a| a.ip()).unwrap_or_else(|| "0.0.0.0".parse().unwrap());
-                let now = Instant::now();
-
-                let mut state = rate_limiter.state.lock().await;
-                let rate_limit_data = state
-                    .entry(ip)
-                    .or_insert_with(|| RateLimitData::new(&rate_limiter.config));
-
-                    if rate_limit_data.is_rate_limited(now) {
-                        return Err(warp::reject::custom(RateLimitError::LimitExceeded));
-                    }
-
-                    // Create info to pass downstream
-            let info = RateLimitData {
-                max_requests: rate_limit_data.max_requests,
-                requests: rate_limit_data.requests.clone(),
-                window_size: rate_limit_data.window_size
-            };
-
-
-                Ok::<_, Rejection>(info)
-            })
-            .boxed()
+                    Err(warp::reject::custom(RateLimitRejection {
+                        retry_after,
+                        limit: self.config.max_requests,
+                        reset_time,
+                        retry_after_format: self.config.retry_after_format.clone(),
+                    }))
+                } else {
+                    // Increment counter
+                    state.insert(key.to_string(), (last_request, count + 1));
+                    Ok(self.config.max_requests - (count + 1))
+                }
+            }
+            None => {
+                // First request
+                state.insert(key.to_string(), (now, 1));
+                Ok(self.config.max_requests - 1)
+            }
+        }
     }
 }
 
-/// Handles rate limit rejection responses.
-///
-/// This function can be used with Warp's `recover` method to provide
-/// proper error responses when rate limits are exceeded.
-///
-/// # Example
-///
-/// The following creates a default filter (100 requests per 60 seconds)
-/// on two endpoints, `/api` and `/endpoint`:
-///
-/// ```rust
-/// use warp_rate_limit::{RateLimit,handle_rejection};
-/// use warp::Filter;
-///
-/// let rate_limiter = RateLimit::new().into_filter();
-/// let route = warp::path!("api" / "endpoint")
-///     .and(rate_limiter)
-///     .map(|_| "Hello, World!")
-///     .recover(handle_rejection);
-/// ```
-pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
-    if let Some(RateLimitError::LimitExceeded) = err.find() {
-        Ok(warp::reply::with_status(
-            "Rate limit exceeded. Please try again later.",
-            warp::http::StatusCode::TOO_MANY_REQUESTS,
-        ))
+/// Creates a rate limiting filter with the given configuration
+pub fn with_rate_limit(
+    config: RateLimitConfig,
+) -> impl Filter<Extract = (u32,), Error = Rejection> + Clone {
+    let rate_limiter = RateLimiter::new(config);
+    
+    warp::filters::addr::remote()
+        .map(move |addr: Option<std::net::SocketAddr>| {
+            (
+                rate_limiter.clone(),
+                addr.map(|a| a.ip().to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            )
+        })
+        .and_then(|(rate_limiter, ip):(RateLimiter, String)| async move {
+            rate_limiter.check_rate_limit(&ip).await
+        })
+}
+
+/// Creates a rate limit response with all required headers
+pub fn create_rate_limit_response(
+    rejection: &RateLimitRejection,
+) -> impl Reply {
+
+    let retry_after = match rejection.retry_after_format {
+        RetryAfterFormat::HttpDate => rejection.reset_time.to_rfc2822(),
+        RetryAfterFormat::Seconds => rejection.retry_after.as_secs().to_string(),
+    };
+
+    let mut res = warp::http::Response::new(format!(
+        "Rate limit exceeded. Try again at {}",
+        rejection.reset_time.to_rfc2822()
+    ));
+
+    res.headers_mut().insert(warp::http::header::RETRY_AFTER, HeaderValue::from_str(&retry_after).unwrap());
+    res.headers_mut().insert("X-RateLimit-Limit", HeaderValue::from_str(&rejection.limit.to_string()).unwrap());
+    res.headers_mut().insert("X-RateLimit-Remaining", HeaderValue::from_str("0").unwrap());
+    res.headers_mut().insert("X-RateLimit-Reset", HeaderValue::from_str(&rejection.reset_time.timestamp().to_string()).unwrap());
+
+    warp::reply::with_status(Box::new(res), warp::http::StatusCode::TOO_MANY_REQUESTS)
+}
+
+/// Default rejection handler for rate limit errors
+pub async fn handle_rate_limit_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
+    if let Some(rate_limit_error) = err.find::<RateLimitRejection>() {
+        Ok(create_rate_limit_response(rate_limit_error))
     } else {
         Err(err)
     }
@@ -274,34 +213,121 @@ pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
     use warp::test::request;
+    use tokio::time::sleep;
+    use tokio::task::JoinSet;
 
     #[tokio::test]
     async fn test_basic_rate_limiting() {
-        let rate_limit = RateLimit::new()
-            .with_window(Duration::from_secs(1))
-            .with_max_requests(2)
-            .into_filter();
-
-        // First two requests should succeed
-        let resp1 = request()
-            .remote_addr(SocketAddr::from(([127, 0, 0, 1], 1234)))
-            .filter(&rate_limit)
+        let config = RateLimitConfig {
+            max_requests: 2,
+            window: Duration::from_secs(5),
+            retry_after_format: RetryAfterFormat::Seconds,
+        };
+        
+        let route = with_rate_limit(config.clone())
+            .map(|remaining: u32| remaining.to_string())
+            .recover(handle_rate_limit_rejection);
+            
+        // First request should succeed
+        let response = request()
+            .remote_addr("127.0.0.1:1234".parse().unwrap())
+            .reply(&route)
             .await;
-        assert!(resp1.is_ok());
-
-        let resp2 = request()
-            .remote_addr(SocketAddr::from(([127, 0, 0, 1], 1234)))
-            .filter(&rate_limit)
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), "1");
+        
+        // Second request should succeed
+        let response = request()
+            .remote_addr("127.0.0.1:1234".parse().unwrap())
+            .reply(&route)
             .await;
-        assert!(resp2.is_ok());
-
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), "0");
+        
         // Third request should fail
-        let resp3 = request()
-            .remote_addr(SocketAddr::from(([127, 0, 0, 1], 1234)))
-            .filter(&rate_limit)
+        let response = request()
+            .remote_addr("127.0.0.1:1234".parse().unwrap())
+            .reply(&route)
             .await;
-        assert!(resp3.is_err());
+
+        assert_eq!(response.status(), 429);
+        assert!(response.headers().contains_key(warp::http::header::RETRY_AFTER));
+        
+        // Wait for window to pass
+        sleep(Duration::from_secs(5)).await;
+        
+        // Request should succeed again
+        let response = request()
+            .remote_addr("127.0.0.1:1234".parse().unwrap())
+            .reply(&route)
+            .await;
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_ips() {
+        let config = RateLimitConfig {
+            max_requests: 1,
+            window: Duration::from_secs(5),
+            retry_after_format: RetryAfterFormat::HttpDate,
+        };
+        
+        let route = with_rate_limit(config.clone())
+            .map(|remaining: u32| remaining.to_string())
+            .recover(handle_rate_limit_rejection);
+            
+        // First IP succeeds
+        let response = request()
+            .remote_addr("127.0.0.1:1234".parse().unwrap())
+            .reply(&route)
+            .await;
+        assert_eq!(response.status(), 200);
+        
+        // First IP fails
+        let response = request()
+            .remote_addr("127.0.0.1:1234".parse().unwrap())
+            .reply(&route)
+            .await;
+        assert_eq!(response.status(), 429);
+        
+        // Second IP succeeds
+        let response = request()
+            .remote_addr("127.0.0.2:1234".parse().unwrap())
+            .reply(&route)
+            .await;
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_requests() {
+        let config = RateLimitConfig {
+            max_requests: 5,
+            window: Duration::from_secs(1),
+            retry_after_format: RetryAfterFormat::Seconds,
+        };
+        
+        let route = with_rate_limit(config.clone())
+            .map(|remaining: u32| remaining.to_string())
+            .recover(handle_rate_limit_rejection);
+            
+        let mut set = JoinSet::new();
+        for _ in 0..10 {
+            let route = route.clone();
+            set.spawn(async move {
+                request()
+                    .remote_addr("127.0.0.1:1234".parse().unwrap())
+                    .reply(&route)
+                    .await
+            });
+        }
+        
+        let mut success_count = 0;
+        while let Some(Ok(resp)) = set.join_next().await {
+            if resp.status() == 200 {
+                success_count += 1;
+            }
+        }
+        assert_eq!(success_count, 5);
     }
 }

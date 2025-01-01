@@ -3,101 +3,160 @@
 [![Crates.io](https://img.shields.io/crates/v/warp-rate-limit.svg)](https://crates.io/crates/warp-rate-limit)
 [![Documentation](https://docs.rs/warp-rate-limit/badge.svg)](https://docs.rs/warp-rate-limit)
 
-A rate-limiting middleware for the Warp web framework.
+Rate-limiting middleware for Warp. Designed to be boring. Implements [RFC 6585](https://datatracker.ietf.org/doc/html/rfc6585#section-4) for "429 Too many Requests" response and [RFC 7231](https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3) for Retry After header.
 
-**Features**:
+## Quickstart
 
-- In memory, IP-based rate limiting
-- Configurable time windows and request limits
-- Thread-safe request tracking
-- Idiomatic integration with existing Warp routes
+First:
+
+`cargo add warp-rate-limit`
+
+Then:
+
+```rust
+use warp_rate_limit::*;
+
+let route = warp::path!("api/some_rate_limited_endpoint")
+    // Add a rate limiter to your route:
+    .and(with_rate_limit(RateLimitConfig::default())) // Default: 60 reqs/min
+    // ...
+    // Add rate limit error handler:
+    .recover(handle_rate_limit_rejection);
+```
 
 ## Usage
 
-You'll first need to include this crate into your project. 
-
-Add this to your `Cargo.toml`:
+Add the crate to your project so that your `Cargo.toml` has:
 
 ```toml
 [dependencies]
-warp-rate-limit = "0.1"
+warp-rate-limit = "0.2"
 ```
 
-Or, run:
+Then, decide how you want to rate-limit your routes. 
 
-```zsh
-cargo add warp-rate-limit
-```
+To rate-limit a route, you'll need to do two things:
 
-Then, you'll need to:
-1. Create a rate limiter, and
-2. Add the rate limiter to a route.
-
-Here's an example:
+1. Add the rate-limiting middlware to your route via the `.and` warp Filter method (`[1]`)
+2. Include the rate-limiting rejection handler via the `.recover` warp Filter method (`[2]`)
 
 ```rust
+use warp::Filter;
+use warp_rate_limit::{RateLimitConfig, with_rate_limit, handle_rate_limit_rejection};
+
+// Using sensible defaults
+let route = warp::path!("api/auth/login")
+    .and(with_rate_limit(RateLimitConfig::default())) // [1]
+    .recover(handle_rate_limit_rejection);            // [2]
+
+// Using the max_per_minute builder configuration:
+let route = warp::path!("api/customers/list")
+    .and(with_rate_limit(RateLimitConfig::max_per_minute(50)))  // 50 req/min
+    .recover(handle_rate_limit_rejection);
+
+// Using a pre-defined set of rate_limits:
+let public_rate_limit = RateLimitConfig::default();
+let partner_rate_limit = RateLimitConfig::max_per_minute(120);
+
+let some_public_route = warp::path!("api/public/some")
+    .and(with_rate_limit( public_rate_limit.clone() )) 
+    .recover( handle_rate_limit_rejection );            
+
+// Using a custom per_minute configuration:
+let route = warp::path!("api/customers/list")
+    .and(with_rate_limit(partner_rate_limit.clone()))  // 10 req/min
+    .recover(handle_rate_limit_rejection);
+```
+
+## Builder methods
+
+| Usage | Description | 
+| :--   | :---        |
+| `RateLimitConfig::default()` | Max requests: 60/minute |
+| `RateLimitConfig::max_per_minute(x:u32)` | Max requests: `x`/minute |
+| `RateLimitConfig::max_per_window(max:u32,window:u64)` | Max requests: `max`/`window` (in seconds) |
+
+## Features
+
+- IP-based rate limiting
+- RFC 7231 compliant headers
+- Zero unsafe code
+- Concurrent request handling
+- Built-in rejection handling
+
+## Response Headers
+
+When rate limited (429 Too Many Requests):
+```http
+HTTP/1.1 429 Too Many Requests
+retry-after: Wed, 1 Jan 2025 00:01:00 GMT
+x-ratelimit-limit: 100
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1704067260
+```
+
+## Configuration
+
+Full control if/when you need it, though I recommend using the builders unless
+you absolutely need to control whether the `retry-after` header uses a date 
+or seconds:
+
+```rust
+let config = RateLimitConfig {
+    max_requests: 5,
+    window: Duration::from_secs(30),  // 5 requests/30s
+    retry_after_format: RetryAfterFormat::Seconds,
+};
+```
+
+## Complete Example
+
+```rust
+use warp::Filter;
+use warp_rate_limit::{RateLimitConfig, with_rate_limit, handle_rate_limit_rejection};
 use std::time::Duration;
-use warp::{Filter, Reply};
-use warp_rate_limit::RateLimit;
 
 #[tokio::main]
 async fn main() {
-    // STEP 1. Create a rate limiter that allows, at most,
-    // 5 requests per every 30 seconds:
-    let rate_limit = RateLimit::new()
-        .with_window(Duration::from_secs(30))
-        .with_max_requests(5)
-        .into_filter(); // Don't forget this part!
+    let hello = warp::path!("hello")
+        .and(with_rate_limit(RateLimitConfig::default()))
+        .map(|remaining: u32| format!("Hello! {} requests remaining", remaining))
+        .recover(handle_rate_limit_rejection);
 
-    // STEP 2. Add the rate limiter to a route:
-    let route = warp::path("hello")
-        .and(rate_limit)
-        .map(|_| "Hello, World!");
-
-    warp::serve(route).run(([127, 0, 0, 1], 3030)).await;
+    warp::serve(hello)
+        .run(([127, 0, 0, 1], 3030))
+        .await;
 }
 ```
 
-## Troubleshooting
+Also check out the examples included in this repo.
 
-If you get the following error:
+## Testing
 
-```
-the trait bound `RateLimit: warp::filter::FilterBase` is not satisfied
-```
-
-Then you likely need to add `into_filter()` to your rate limiter. For example:
-
-```
-let public_rate_limit = RateLimit::new().with_max_requests(10).into_filter();
-let partner_rate_limit = RateLimit::new().with_max_requests(200).into_filter();
+Run the test suite:
+```bash
+cargo test
 ```
 
-
-## Configuration Options
-
-See the [documentation](https://docs.rs/warp-rate-limit).
-
-## Designed to be Small
-
-For most basic web applications these limitations are acceptable, but if you need more advanced features, consider using a dedicated rate-limiting solution with persistent storage.
-
-- **IP-based only**: Rate limiting is performed based on IP address. This may not be suitable if your application is behind a proxy or if you need to rate limit by other identifiers (e.g., API keys, user IDs).
-- **In-memory storage**: Rate limit data is stored in memory using a `HashMap`. This means:
-  - Rate limit data is not persisted across server restarts
-  - May not be suitable for high-scale deployments with multiple instances
-  - Memory usage grows with the number of unique IPs making requests
-- **Single window**: Only supports a single fixed-time window. Does not support more complex rate limiting strategies like sliding windows or token bucket algorithms.
-- **No clustering support**: When running multiple instances of your application, each instance maintains its own rate limit counters. This could allow more requests than intended in a distributed setup.
-- **No advanced configuration**: This is intended to be a simple, small solution for basic rate limiting, and as such, there is no support for per-route rate limiting, burst allowances, customr response headers, or allow/deny list support.
-
-If any of these limitations are a blocker for you, consider augmenting the crate and submitting a PR.
-
+Try the examples:
+```bash
+cargo run --example basic
+```
 
 ## License
 
-[MIT license](http://opensource.org/licenses/MIT).
+Released under MIT License.
 
-## Contributing
+```
+LICENSE
 
-Contributions are welcome and appreciated. Submit a PR when you're ready.
+Copyright (c) 2024 Jesse Lawson.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+Issues and PRs welcome.

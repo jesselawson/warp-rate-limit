@@ -1,37 +1,31 @@
 use std::time::Duration;
 use warp::Filter;
-use warp_rate_limit::{RateLimit, handle_rejection};
+use warp_rate_limit::*;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    // Configure rate limiting: 5 reqs/30s
+    let rate_limit = RateLimitConfig {
+        max_requests: 5,
+        window: Duration::from_secs(30),
+        retry_after_format: RetryAfterFormat::HttpDate,
+    };
 
-    let rate_limit = RateLimit::new()
-        .with_window(Duration::from_secs(30))
-        .with_max_requests(5)
-        .into_filter();
+    // Protected endpoint
+    let route = warp::path!("api" / "rate_limited")
+        .and(with_rate_limit(rate_limit)) // Don't forget to .clone() if you are using this more than once!
+        .map(|remaining: u32| {
+            warp::reply::json(&serde_json::json!({
+                "message": "Success",
+                "remaining_requests": remaining
+            }))
+        })
+        .recover(handle_rate_limit_rejection);
 
-    let hello = warp::path("hello")
-        .and(rate_limit.clone())
-        .map(|_| "Hello, World!");
 
-    let api = warp::path("api")
-        .and(rate_limit)
-        .map(|_| warp::reply::json(&serde_json::json!({
-            "status": "success",
-            "message": "API response"
-        })));
 
-    let routes = hello
-        .or(api)
-        .recover(handle_rejection);
-
-    println!("Server running at http://127.0.0.1:3030");
-    println!("Try:");
-    println!("  - http://127.0.0.1:3030/hello");
-    println!("  - http://127.0.0.1:3030/api");
-
-    warp::serve(routes)
-        .run(([127, 0, 0, 1], 3030))
-        .await;
+    println!("Server running on http://127.0.0.1:3030");
+    println!("To see a rate-limited response, issue a request more than five times.");
+    println!("Example: `curl -i http://127.0.0.1:3030/api/rate_limited`");
+    warp::serve(route).run(([127, 0, 0, 1], 3030)).await;
 }
