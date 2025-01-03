@@ -64,7 +64,7 @@ let some_public_route = warp::path!("api/public/some")
 
 // Using a custom per_minute configuration:
 let route = warp::path!("api/customers/list")
-    .and(with_rate_limit(partner_rate_limit.clone()))  // 10 req/min
+    .and(with_rate_limit(partner_rate_limit.clone()))
     .recover(handle_rate_limit_rejection);
 ```
 
