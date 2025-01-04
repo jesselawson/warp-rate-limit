@@ -38,6 +38,8 @@ impl Default for RateLimitConfig {
     }
 }
 
+
+
 /// Factory methods for quickly building a rate limiter
 impl RateLimitConfig {
     /// Build a `RateLimitConfig` with sensible defaults. In this 
@@ -82,11 +84,12 @@ impl RateLimitConfig {
 }
 
 /// Format options for the Retry-After header
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum RetryAfterFormat {
     /// HTTP-date format (RFC 7231)
     HttpDate,
     /// Number of seconds
+    #[default]
     Seconds,
 }
 
@@ -181,7 +184,7 @@ pub fn with_rate_limit(
 /// Creates a rate limit response with all required headers
 pub fn create_rate_limit_response(
     rejection: &RateLimitRejection,
-) -> impl Reply {
+) -> Result<impl Reply, Box<dyn std::error::Error + Send + Sync + 'static>> {
 
     let retry_after = match rejection.retry_after_format {
         RetryAfterFormat::HttpDate => rejection.reset_time.to_rfc2822(),
@@ -198,16 +201,7 @@ pub fn create_rate_limit_response(
     res.headers_mut().insert("X-RateLimit-Remaining", HeaderValue::from_str("0").unwrap());
     res.headers_mut().insert("X-RateLimit-Reset", HeaderValue::from_str(&rejection.reset_time.timestamp().to_string()).unwrap());
 
-    warp::reply::with_status(Box::new(res), warp::http::StatusCode::TOO_MANY_REQUESTS)
-}
-
-/// Default rejection handler for rate limit errors
-pub async fn handle_rate_limit_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
-    if let Some(rate_limit_error) = err.find::<RateLimitRejection>() {
-        Ok(create_rate_limit_response(rate_limit_error))
-    } else {
-        Err(err)
-    }
+    Ok(warp::reply::with_status(Box::new(res), warp::http::StatusCode::TOO_MANY_REQUESTS))
 }
 
 #[cfg(test)]
@@ -227,7 +221,16 @@ mod tests {
         
         let route = with_rate_limit(config.clone())
             .map(|remaining: u32| remaining.to_string())
-            .recover(handle_rate_limit_rejection);
+            .recover(|r:Rejection| async move {
+                if r.find::<RateLimitRejection>().is_some() {
+                    Ok(warp::reply::with_status(
+                        "rate limited",
+                        warp::http::StatusCode::TOO_MANY_REQUESTS
+                    ))
+                } else {
+                    Err(r)
+                }
+            });
             
         // First request should succeed
         let response = request()
@@ -275,7 +278,16 @@ mod tests {
         
         let route = with_rate_limit(config.clone())
             .map(|remaining: u32| remaining.to_string())
-            .recover(handle_rate_limit_rejection);
+            .recover(|r:Rejection| async move {
+                if r.find::<RateLimitRejection>().is_some() {
+                    Ok(warp::reply::with_status(
+                        "rate limited",
+                        warp::http::StatusCode::TOO_MANY_REQUESTS
+                    ))
+                } else {
+                    Err(r)
+                }
+            });
             
         // First IP succeeds
         let response = request()
@@ -309,7 +321,16 @@ mod tests {
         
         let route = with_rate_limit(config.clone())
             .map(|remaining: u32| remaining.to_string())
-            .recover(handle_rate_limit_rejection);
+            .recover(|r:Rejection| async move {
+                if r.find::<RateLimitRejection>().is_some() {
+                    Ok(warp::reply::with_status(
+                        "rate limited",
+                        warp::http::StatusCode::TOO_MANY_REQUESTS
+                    ))
+                } else {
+                    Err(r)
+                }
+            });
             
         let mut set = JoinSet::new();
         for _ in 0..10 {

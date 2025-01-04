@@ -1,5 +1,5 @@
 use std::time::Duration;
-use warp::Filter;
+use warp::{reject::Rejection, Filter};
 use warp_rate_limit::*;
 
 #[tokio::main]
@@ -20,7 +20,15 @@ async fn main() {
                 "remaining_requests": remaining
             }))
         })
-        .recover(handle_rate_limit_rejection);
+        .recover(|rejection: Rejection| async move {
+            if rejection.find::<RateLimitRejection>().is_some() {
+                Ok(warp::reply::with_status(
+                    "Rate limit exceeded",
+                warp::http::StatusCode::TOO_MANY_REQUESTS))
+            } else {
+                Err(rejection)
+            }
+        });
 
 
 
