@@ -85,7 +85,7 @@
 //! 
 //!         // Then, let's add the rate-limiting headers to that response:
 //!         if let Err(e) = add_rate_limit_headers(response.headers_mut(), &info) {
-//!             // Whether or not you handle the specific RateLimitError in 
+//!             // Whether or not you use the specific RateLimitError in 
 //!             // your handler, consider handling errors explicitly here. 
 //!             // Again, though, you're free to `if let _ = add_rate_limit_headers(...` 
 //!             // if you don't care about these errors.
