@@ -18,7 +18,7 @@
 //! 2. Define one or more rate limit configurations. Following are some 
 //! examples of available builder methods. The variable names are arbitrary: 
 //! 
-//! ```rust,no_run
+//! ```rust,no_run,ignore
 //! // Limit: 60 requests per 60 Earth seconds
 //! let public_routes_rate_limit = RateLimitConfig::default();
 //! 
@@ -33,7 +33,7 @@
 //! to use rate-limiting information related to the IP address associated 
 //! with this request, you can skip this part. 
 //! 
-//! ```rust,no_run
+//! ```rust,no_run,ignore
 //! // Example route handler
 //! async fn hande_request(rate_limit_info: RateLimitInfo) -> Result<impl Reply, Rejection> {
 //!     // Create a base response
@@ -63,7 +63,7 @@
 //! 
 //! 4. Handle rate limit errors in your rejection handler: 
 //! 
-//! ```rust,no_run
+//! ```rust,no_run,ignore
 //! // Example rejection handler
 //! async fn handle_rejection(rejection: Rejection) -> Result<impl Reply, Infallible> {
 //!     // Somewhere in your rejection handling:
