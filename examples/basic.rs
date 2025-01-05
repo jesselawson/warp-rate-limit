@@ -75,16 +75,16 @@ async fn handle_rejection(rejection: Rejection) -> Result<impl Reply, Infallible
 
         // Then, let's add the rate-limiting headers to that response:
 
-        // If you really don't care about the error:
+        // If you really don't care about the error, you can do something like this:
         // let _ = add_rate_limit_headers(response.headers_mut(), &info);
 
         // If you care about the fact that it errored but not necessarily
-        // the specific error itself:
+        // the specific error itself, you can do something like this:
         // if !add_rate_limit_headers(response.headers_mut(), &info).is_ok() {
         //     eprintln!("Failed to set headers");
         // }
 
-        // If you want full control over error handling: 
+        // If you want full control over error handling, you can do something like this:
         if let Err(e) = add_rate_limit_headers(response.headers_mut(), &info) {
             match e {
                 RateLimitError::HeaderError(e) => {

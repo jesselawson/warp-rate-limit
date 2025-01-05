@@ -1,7 +1,4 @@
 #![forbid(unsafe_code)]
-
-//! Rate limiting middleware for Warp
-//! 
 //! This crate provides RFC 6585 compliant in-memory rate limiting with 
 //! configurable windows and limits as lightweight middleware for 
 //! Warp web applications.
