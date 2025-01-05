@@ -204,4 +204,19 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-Issues and PRs welcome.
+## Contributing 
+
+Enhancements and fixes are welcome and encouraged. Please open an Issue in this 
+repository to discuss changes that would significantly alter how this library is used. 
+
+## Testing
+
+Run the test suite:
+```bash
+cargo test
+```
+
+Try the examples:
+```bash
+cargo run --example basic
+```
