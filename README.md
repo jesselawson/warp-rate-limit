@@ -3,12 +3,9 @@
 [![Crates.io](https://img.shields.io/crates/v/warp-rate-limit.svg)](https://crates.io/crates/warp-rate-limit)
 [![Documentation](https://docs.rs/warp-rate-limit/badge.svg)](https://docs.rs/warp-rate-limit)
 
-Rate-limiting middleware for Warp.  Implements [RFC 6585](https://datatracker.ietf.org/doc/html/rfc6585#section-4) for "429 Too many Requests" response and [RFC 7231](https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3) for Retry After header.
-
 This crate provides [RFC 6585](https://datatracker.ietf.org/doc/html/rfc6585#section-4) 
 and [RFC 7231](https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3) compliant 
-in-memory rate limiting with configurable windows and limits as lightweight middleware for 
-Warp web applications.
+in-memory rate limiting as lightweight middleware for Warp web applications.
  
 It provides a Filter you can add to your routes that exposes rate-limiting
 information to your handlers, and a rate limited `Rejection` type for error recovery.
