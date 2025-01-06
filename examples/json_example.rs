@@ -4,6 +4,13 @@ use std::convert::Infallible;
 use warp::{Filter, Rejection, Reply, http::StatusCode};
 use warp_rate_limit::*;
 
+// This example is similar to the basic.rs example, but differs in how it responds to 
+// requests. Whereas the basic.rs example shows a text-based response, this 
+// example illustrates how to incorporate the warp-rate-limit library in the context 
+// of JSON responses. 
+
+// When we create the JSON response in the rejection handler, we'll use a custom 
+// struct so that our JSON response is typed:
 #[derive(Serialize)]
 struct MyCustomError {
     error: String,
