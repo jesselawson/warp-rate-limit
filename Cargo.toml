@@ -1,10 +1,10 @@
 [package]
 name = "warp-rate-limit"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Rate limiting middleware for the Warp web framework"
+description = "Rate-limiting middleware for the Warp web framework"
 authors = ["Jesse Lawson <jesse@lawsonry.com>"]
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/jesselawson/warp-rate-limit"
 documentation = "https://docs.rs/warp-rate-limit"
 readme = "README.md"
@@ -16,6 +16,7 @@ warp = "0.3"
 tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
 chrono = "0.4.39"
+serde = { version = "1.0.217", features = ["derive"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
