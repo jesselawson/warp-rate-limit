@@ -6,8 +6,12 @@
 //! It provides a Filter you add to your routes that exposes rate-limiting
 //! information to your handlers, and a Rejection Type for error recovery.
 //! 
-//! It does not yet provide persistence, nor is the HashMap that stores IPs
-//! bounded. Both of these may be changed in a future version. 
+//! It does not yet provide persistence; this may be changed in a future
+//! version.
+//!
+//! Memory use is kept in check two ways: entries whose window has elapsed
+//! are cleaned up automatically, and you can optionally set a hard cap on
+//! the number of tracked IPs with [`RateLimitConfig::with_max_tracked_ips`].
 //! 
 //! # Quickstart
 //! 
@@ -27,6 +31,11 @@
 //! 
 //! // Limit: 10 requests per 20 Earth seconds
 //! let static_route_limit = RateLimitConfig::max_per_window(10,20);
+//!
+//! // Limit: 100 requests per 60 Earth seconds, tracking at most
+//! // 10,000 client IPs at a time (bounds memory use)
+//! let bounded_rate_limit = RateLimitConfig::max_per_minute(100)
+//!     .with_max_tracked_ips(10_000);
 //! ```
 //! 
 //! 3. Use rate limiting information in request handler. If you don't want 
@@ -134,6 +143,12 @@ pub struct RateLimitConfig {
     pub window: Duration,
     /// Format for Retry-After header (RFC 7231 Date or Seconds)
     pub retry_after_format: RetryAfterFormat,
+    /// Maximum number of client IPs to track at once. When the cap is
+    /// reached and a request arrives from a new IP, expired entries are
+    /// discarded first; if the map is still full, the entry closest to
+    /// the end of its window is evicted to make room. `None` (the
+    /// default) means no cap. A value of `0` is treated as `1`.
+    pub max_tracked_ips: Option<usize>,
 }
 
 /// Format options for the Retry-After header
@@ -183,6 +198,7 @@ impl Default for RateLimitConfig {
             max_requests: 60, // 60 req/min baseline
             window: Duration::from_secs(60),
             retry_after_format: RetryAfterFormat::HttpDate,
+            max_tracked_ips: None,
         }
     }
 }
@@ -204,6 +220,16 @@ impl RateLimitConfig {
             max_requests,
             window: Duration::from_secs(window_seconds),
             ..Default::default()
+        }
+    }
+
+    /// Cap the number of client IPs tracked at once, bounding the rate
+    /// limiter's memory use. See [`RateLimitConfig::max_tracked_ips`]
+    /// for the eviction behavior when the cap is reached.
+    pub fn with_max_tracked_ips(self, max: usize) -> Self {
+        Self {
+            max_tracked_ips: Some(max),
+            ..self
         }
     }
 }
@@ -235,16 +261,36 @@ impl std::error::Error for RateLimitError {
     }
 }
 
+struct RateLimiterState {
+    /// Per-IP rate-limiting data: (window start, request count)
+    clients: HashMap<String, (Instant, u32)>,
+    /// When the last periodic sweep of expired entries ran
+    last_sweep: Instant,
+}
+
+impl RateLimiterState {
+    /// Drop entries whose window has fully elapsed. An expired entry is
+    /// indistinguishable from an absent one (both reset on the next
+    /// request), so this never changes a rate-limiting decision.
+    fn purge_expired(&mut self, now: Instant, window: Duration) {
+        self.clients
+            .retain(|_, (start, _)| now.duration_since(*start) <= window);
+    }
+}
+
 #[derive(Clone)]
 struct RateLimiter {
-    state: Arc<RwLock<HashMap<String, (Instant, u32)>>>,
+    state: Arc<RwLock<RateLimiterState>>,
     config: RateLimitConfig,
 }
 
 impl RateLimiter {
     fn new(config: RateLimitConfig) -> Self {
         Self {
-            state: Arc::new(RwLock::new(HashMap::new())),
+            state: Arc::new(RwLock::new(RateLimiterState {
+                clients: HashMap::new(),
+                last_sweep: Instant::now(),
+            })),
             config,
         }
     }
@@ -252,13 +298,21 @@ impl RateLimiter {
     async fn check_rate_limit(&self, key: &str) -> Result<RateLimitInfo, Rejection> {
         let mut state = self.state.write().await;
         let now = Instant::now();
-        let current = state.get(key).copied();
+
+        // Amortized cleanup: at most once per window, drop expired
+        // entries so the map only holds recently-seen IPs.
+        if now.duration_since(state.last_sweep) >= self.config.window {
+            state.purge_expired(now, self.config.window);
+            state.last_sweep = now;
+        }
+
+        let current = state.clients.get(key).copied();
 
         match current {
             Some((last_request, count)) => {
                 if now.duration_since(last_request) > self.config.window {
                     // Window has passed, reset counter
-                    state.insert(key.to_string(), (now, 1));
+                    state.clients.insert(key.to_string(), (now, 1));
                     Ok(self.create_info(self.config.max_requests - 1, now))
                 } else if count >= self.config.max_requests {
                     // Rate limit exceeded
@@ -273,7 +327,7 @@ impl RateLimiter {
                     }))
                 } else {
                     // Increment counter
-                    state.insert(key.to_string(), (last_request, count + 1));
+                    state.clients.insert(key.to_string(), (last_request, count + 1));
                     Ok(self.create_info(
                         self.config.max_requests - (count + 1),
                         last_request,
@@ -281,10 +335,39 @@ impl RateLimiter {
                 }
             }
             None => {
-                // First request
-                state.insert(key.to_string(), (now, 1));
+                // First request from this IP
+                self.make_room(&mut state, now);
+                state.clients.insert(key.to_string(), (now, 1));
                 Ok(self.create_info(self.config.max_requests - 1, now))
             }
+        }
+    }
+
+    /// Enforce `max_tracked_ips` before tracking a new IP: purge expired
+    /// entries first, and if the map is still at capacity, evict the
+    /// entry closest to the end of its window. That entry would have
+    /// expired soonest anyway, so evicting it loses the least state.
+    fn make_room(&self, state: &mut RateLimiterState, now: Instant) {
+        let Some(max) = self.config.max_tracked_ips else {
+            return;
+        };
+        let max = max.max(1);
+
+        if state.clients.len() < max {
+            return;
+        }
+        state.purge_expired(now, self.config.window);
+
+        if state.clients.len() < max {
+            return;
+        }
+        let oldest = state
+            .clients
+            .iter()
+            .min_by_key(|&(_, &(start, _))| start)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            state.clients.remove(&oldest);
         }
     }
 
@@ -419,6 +502,12 @@ mod tests {
         assert_eq!(default.window, Duration::from_secs(60));
         assert_eq!(default.max_requests, 60);
         assert_eq!(default.retry_after_format, RetryAfterFormat::HttpDate);
+        assert_eq!(default.max_tracked_ips, None);
+
+        // Test with_max_tracked_ips builder
+        let bounded = RateLimitConfig::max_per_minute(100).with_max_tracked_ips(500);
+        assert_eq!(bounded.max_requests, 100);
+        assert_eq!(bounded.max_tracked_ips, Some(500));
     }
 
     #[tokio::test]
@@ -427,6 +516,7 @@ mod tests {
             max_requests: 1,
             window: Duration::from_secs(5),
             retry_after_format: RetryAfterFormat::Seconds,
+            max_tracked_ips: None,
         };
 
         let route = create_test_route(config.clone()).await;
@@ -470,6 +560,7 @@ mod tests {
             max_requests: 1,
             window: Duration::from_secs(15),
             retry_after_format: RetryAfterFormat::HttpDate,
+            max_tracked_ips: None,
         };
 
         let http_date_route = create_test_route(http_date_config).await;
@@ -494,6 +585,7 @@ mod tests {
             max_requests: 1,
             window: Duration::from_secs(5),
             retry_after_format: RetryAfterFormat::Seconds,
+            max_tracked_ips: None,
         };
 
         let seconds_route = create_test_route(seconds_config).await;
@@ -550,6 +642,7 @@ mod tests {
             max_requests: 5,
             window: Duration::from_secs(1),
             retry_after_format: RetryAfterFormat::Seconds,
+            max_tracked_ips: None,
         };
 
         let route = create_test_route(config.clone()).await;
@@ -594,5 +687,120 @@ mod tests {
         
         let result = add_rate_limit_headers(&mut headers, &invalid_info);
         assert!(matches!(result, Err(RateLimitError::HeaderError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_max_tracked_ips_bounds_state() {
+        let config = RateLimitConfig {
+            max_requests: 10,
+            window: Duration::from_secs(60),
+            retry_after_format: RetryAfterFormat::Seconds,
+            max_tracked_ips: Some(3),
+        };
+        let limiter = RateLimiter::new(config);
+
+        // Ten distinct IPs, but the map never grows past the cap
+        for i in 0..10 {
+            limiter
+                .check_rate_limit(&format!("10.0.0.{}", i))
+                .await
+                .unwrap();
+            assert!(limiter.state.read().await.clients.len() <= 3);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // The most recently seen IPs are the ones retained
+        let state = limiter.state.read().await;
+        assert_eq!(state.clients.len(), 3);
+        assert!(state.clients.contains_key("10.0.0.7"));
+        assert!(state.clients.contains_key("10.0.0.8"));
+        assert!(state.clients.contains_key("10.0.0.9"));
+    }
+
+    #[tokio::test]
+    async fn test_eviction_removes_entry_closest_to_expiry() {
+        let config = RateLimitConfig {
+            max_requests: 10,
+            window: Duration::from_secs(60),
+            retry_after_format: RetryAfterFormat::Seconds,
+            max_tracked_ips: Some(2),
+        };
+        let limiter = RateLimiter::new(config);
+
+        limiter.check_rate_limit("10.0.0.1").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        limiter.check_rate_limit("10.0.0.2").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        limiter.check_rate_limit("10.0.0.3").await.unwrap();
+
+        let state = limiter.state.read().await;
+        assert_eq!(state.clients.len(), 2);
+        assert!(
+            !state.clients.contains_key("10.0.0.1"),
+            "the entry with the oldest window should have been evicted"
+        );
+        assert!(state.clients.contains_key("10.0.0.2"));
+        assert!(state.clients.contains_key("10.0.0.3"));
+    }
+
+    #[tokio::test]
+    async fn test_sweep_removes_expired_entries_without_a_cap() {
+        let config = RateLimitConfig {
+            max_requests: 10,
+            window: Duration::from_millis(100),
+            retry_after_format: RetryAfterFormat::Seconds,
+            max_tracked_ips: None,
+        };
+        let limiter = RateLimiter::new(config);
+
+        limiter.check_rate_limit("10.0.0.1").await.unwrap();
+        limiter.check_rate_limit("10.0.0.2").await.unwrap();
+        assert_eq!(limiter.state.read().await.clients.len(), 2);
+
+        // Let both windows lapse, then make any request: the periodic
+        // sweep drops the stale entries even with no cap configured.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        limiter.check_rate_limit("10.0.0.3").await.unwrap();
+
+        let state = limiter.state.read().await;
+        assert_eq!(state.clients.len(), 1);
+        assert!(state.clients.contains_key("10.0.0.3"));
+    }
+
+    #[tokio::test]
+    async fn test_evicted_ip_gets_fresh_window() {
+        let config = RateLimitConfig {
+            max_requests: 1,
+            window: Duration::from_secs(60),
+            retry_after_format: RetryAfterFormat::Seconds,
+            max_tracked_ips: Some(1),
+        };
+        let route = create_test_route(config).await;
+
+        // First IP uses up its limit
+        let resp = request()
+            .remote_addr("127.0.0.1:1234".parse().unwrap())
+            .reply(&route)
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = request()
+            .remote_addr("127.0.0.1:1234".parse().unwrap())
+            .reply(&route)
+            .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A second IP evicts the first (cap is 1)...
+        let resp = request()
+            .remote_addr("127.0.0.2:1234".parse().unwrap())
+            .reply(&route)
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // ...so the first IP starts over with a fresh window
+        let resp = request()
+            .remote_addr("127.0.0.1:1234".parse().unwrap())
+            .reply(&route)
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
