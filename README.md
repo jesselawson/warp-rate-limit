@@ -118,12 +118,12 @@ async fn your_rejection_handler(rejection: Rejection) -> Result<impl Reply, Infa
 * `with_rate_limit(config: RateLimitConfig)`: given your `RateLimitConfig`, injects a `Filter` 
   into your route that exposes a `RateLimitInfo` struct to your handler.
 * `add_rate_limit_headers(&mut HeaderMap, &RateLimitInfo)`: given a mutable reference to the 
-  headers of a [`Response`](https://docs.rs/warp/0.3.7/warp/reply/type.Response.html) (e.g., `response.headers_mut()`) 
+  headers of a [`Response`](https://docs.rs/warp/latest/warp/reply/type.Response.html) (e.g., `response.headers_mut()`) 
   and a reference to a populated `RateLimitInfo` struct, adds headers related to rate-limiting to the `Response` reference 
   provided. Headers can be included in both successful replies (e.g., `200`) as well as rate-limited responses (e.g., `429`).
   The required `RateLimitInfo` struct comes from either the `Filter` that injects it into your handler, or manually in 
   your rejection recovery handler via `get_rate_limit_info()`.
-* `get_rate_limit_info(&RateLimitRejection)`: given a [`Rejection`](https://docs.rs/warp/0.3.7/warp/reject/struct.Rejection.html)
+* `get_rate_limit_info(&RateLimitRejection)`: given a [`Rejection`](https://docs.rs/warp/latest/warp/reject/struct.Rejection.html)
   that includes a `RateLimitRejection` (e.g., `if let Some(rate_limited_rejection) = rejection.find::<RateLimitRejection>()`), 
   return a `RateLimitInfo` struct that contains information related to the currently rate-limited IP address. This is useful 
   for letting the requestor know that they are being rate-limited, as well as when their rate limit will be released. 
