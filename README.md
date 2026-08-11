@@ -50,8 +50,7 @@ let my_route = warp::path!("some_ratelimited_route")
     .and(with_rate_limit(public_routes_rate_limit.clone()))
     // - - -- --- ----- -------- ------------- ---------------------
     .and_then(your_request_handler)
-    .recover(your_rejection_handler)
-
+    .recover(your_rejection_handler);
 ```
 
 4. Use the `RateLimitInfo` data in your request handler. If you don't want 
@@ -98,7 +97,7 @@ async fn your_rejection_handler(rejection: Rejection) -> Result<impl Reply, Infa
         ).into_response();
 
         // Then, add the rate-limiting headers to that response:
-        let _ = add_rate_limit_headers(response.headers_mut(), &rate_limit_info);
+        let _ = add_rate_limit_headers(response.headers_mut(), &info);
 
         Ok(response)    
 
