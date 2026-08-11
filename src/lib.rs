@@ -386,19 +386,22 @@ impl RateLimiter {
     }
 
     fn create_info(&self, remaining: u32, start: Instant) -> RateLimitInfo {
-        let reset_time = start + self.config.window;
+        // `start` is the beginning of the client's current window, so
+        // the limit resets once the rest of that window elapses -- not
+        // a full window from now.
+        let until_reset = self.config.window.saturating_sub(start.elapsed());
+        let reset_at = Utc::now() + ChronoDuration::from_std(until_reset).unwrap();
+
         let retry_after = match self.config.retry_after_format {
-            RetryAfterFormat::HttpDate => {
-                (Utc::now() + ChronoDuration::from_std(self.config.window).unwrap()).to_rfc2822()
-            }
-            RetryAfterFormat::Seconds => self.config.window.as_secs().to_string(),
+            RetryAfterFormat::HttpDate => reset_at.to_rfc2822(),
+            RetryAfterFormat::Seconds => until_reset.as_secs().to_string(),
         };
 
         RateLimitInfo {
             retry_after,
             limit: self.config.max_requests,
             remaining,
-            reset_timestamp: (Utc::now() + ChronoDuration::from_std(reset_time.duration_since(start)).unwrap()).timestamp(),
+            reset_timestamp: reset_at.timestamp(),
             retry_after_format: self.config.retry_after_format.clone(),
         }
     }
@@ -726,6 +729,37 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(resp.headers().get("X-RateLimit-Limit").unwrap(), "0");
         assert_eq!(resp.headers().get("X-RateLimit-Remaining").unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn test_info_reports_end_of_current_window() {
+        let config = RateLimitConfig {
+            max_requests: 5,
+            window: Duration::from_secs(10),
+            retry_after_format: RetryAfterFormat::Seconds,
+            max_tracked_ips: None,
+        };
+        let limiter = RateLimiter::new(config);
+
+        let first = limiter.check_rate_limit("10.0.0.1").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let second = limiter.check_rate_limit("10.0.0.1").await.unwrap();
+
+        // Both requests fall in the same window, so they must report
+        // the same reset moment (give or take a second of truncation),
+        // not a full window from each request's arrival time.
+        assert!((second.reset_timestamp - first.reset_timestamp).abs() <= 1);
+
+        // With the Seconds format, retry_after counts down as the
+        // window elapses.
+        let first_retry: u64 = first.retry_after.parse().unwrap();
+        let second_retry: u64 = second.retry_after.parse().unwrap();
+        assert!(
+            second_retry <= first_retry.saturating_sub(1),
+            "retry_after should shrink mid-window (first: {}, second: {})",
+            first_retry,
+            second_retry
+        );
     }
 
     #[tokio::test]

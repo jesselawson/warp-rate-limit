@@ -176,6 +176,10 @@ x-ratelimit-remaining: 0
 x-ratelimit-reset: 1704067260
 ```
 
+`retry-after` and `x-ratelimit-reset` reflect the end of the requesting 
+client's *current* window -- including when you add these headers to 
+successful responses -- not a full window from the time of the response.
+
 ## Error handling
 
 The Quickstart example shows a form of error handling appropriate in situations 
