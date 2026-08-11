@@ -121,6 +121,9 @@ async fn your_rejection_handler(rejection: Rejection) -> Result<impl Reply, Infa
 | `RateLimitConfig::max_per_window(max:u32,window:u64)` | Max requests: `max`/`window` (in seconds) |
 | `.with_max_tracked_ips(max:usize)` | Chainable; track at most `max` IPs at a time |
 
+A `max_requests` of `0` rejects every request. In that case no per-IP state 
+is stored at all, since request history can never change the outcome.
+
 ## Bounding memory use
 
 Rate-limiting state is kept in an in-memory map keyed by client IP. Two 

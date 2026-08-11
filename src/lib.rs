@@ -137,7 +137,8 @@ pub use serde;
 /// Configuration for the rate limiter
 #[derive(Clone, Debug, PartialEq)]
 pub struct RateLimitConfig {
-    /// Maximum number of requests allowed within the window
+    /// Maximum number of requests allowed within the window. A value
+    /// of `0` rejects every request.
     pub max_requests: u32,
     /// Time window for rate limiting
     pub window: Duration,
@@ -296,6 +297,19 @@ impl RateLimiter {
     }
 
     async fn check_rate_limit(&self, key: &str) -> Result<RateLimitInfo, Rejection> {
+        // A limit of zero can never admit a request, so reject without
+        // consulting (or growing) the state map.
+        if self.config.max_requests == 0 {
+            let retry_after = self.config.window;
+            let reset_time = Utc::now() + ChronoDuration::from_std(retry_after).unwrap();
+            return Err(reject::custom(RateLimitRejection {
+                retry_after,
+                limit: 0,
+                reset_time,
+                retry_after_format: self.config.retry_after_format.clone(),
+            }));
+        }
+
         let mut state = self.state.write().await;
         let now = Instant::now();
 
@@ -687,6 +701,31 @@ mod tests {
         
         let result = add_rate_limit_headers(&mut headers, &invalid_info);
         assert!(matches!(result, Err(RateLimitError::HeaderError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_zero_max_requests_rejects_all_requests() {
+        let config = RateLimitConfig {
+            max_requests: 0,
+            window: Duration::from_secs(60),
+            retry_after_format: RetryAfterFormat::Seconds,
+            max_tracked_ips: None,
+        };
+
+        // Directly: rejected without panicking, and nothing is tracked
+        let limiter = RateLimiter::new(config.clone());
+        assert!(limiter.check_rate_limit("10.0.0.1").await.is_err());
+        assert!(limiter.state.read().await.clients.is_empty());
+
+        // End to end: every request gets a 429 with rate limit headers
+        let route = create_test_route(config).await;
+        let resp = request()
+            .remote_addr("127.0.0.1:1234".parse().unwrap())
+            .reply(&route)
+            .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get("X-RateLimit-Limit").unwrap(), "0");
+        assert_eq!(resp.headers().get("X-RateLimit-Remaining").unwrap(), "0");
     }
 
     #[tokio::test]
