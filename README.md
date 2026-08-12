@@ -125,14 +125,12 @@ is stored at all, since request history can never change the outcome.
 
 ## Bounding memory use
 
-Rate-limiting state is kept in an in-memory map keyed by client IP. Two 
-mechanisms keep it from growing unbounded:
+Rate-limiting state is kept in an in-memory map keyed by client IP. 
+To prevent growing unbounded, once per window any entries with elapsed windows 
+will be cleaned up. The map only holds IPs seen within roughly the last two windows.
 
-* Entries whose window has elapsed are cleaned up automatically. The cleanup 
-  is amortized across requests and runs at most once per window, so the map 
-  only holds IPs seen within roughly the last two windows.
-* You can set a hard cap on the number of IPs tracked at once, which is 
-  useful in memory-constrained environments:
+You can set a hard cap on the number of IPs tracked at once, which is 
+useful in memory-constrained environments:
 
   ```rust
   // Never track more than 10,000 IPs (roughly 1-2 MB of state)
@@ -141,12 +139,12 @@ mechanisms keep it from growing unbounded:
   ```
 
 When the cap is reached and a request arrives from a new IP, expired entries 
-are discarded first; if the map is still full, the entry closest to the end 
-of its window (the one that would have expired soonest) is evicted to make 
-room. An evicted client that returns starts a fresh window, so a cap that is 
-small relative to your number of concurrent clients weakens enforcement. 
-Size the cap to comfortably exceed the number of distinct client IPs you 
-expect within one window.
+are discarded first. If the map is still full, the entry closest to the end 
+of its window (the one that would have expired soonest) is removed to make 
+room for the new entry. This means that an evicted IP that returns will start a fresh 
+window, so a cap that is small relative to your number of concurrent clients may 
+weaken enforcement. It is recommended that you size the cap to comfortably exceed 
+the number of distinct client IPs you expect within one window.
 
 ## Reference
 
