@@ -9,6 +9,9 @@ async fn main() {
         max_requests: 5,
         window: std::time::Duration::from_secs(30),
         retry_after_format: RetryAfterFormat::HttpDate,
+        // Optionally bound memory use by capping how many IPs are
+        // tracked at once, e.g. `Some(10_000)`:
+        max_tracked_ips: None,
     };
 
     // We'll have a single route, /hello, that will be rate limited:

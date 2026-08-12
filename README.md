@@ -10,8 +10,10 @@ in-memory rate limiting as lightweight middleware for Warp web applications.
 It provides a Filter you can add to your routes that exposes rate-limiting
 information to your handlers, and a rate limited `Rejection` type for error recovery.
  
-It does not yet provide persistence, nor is the HashMap that stores IPs bounded. Both 
-of these may be changed in a future version.
+It does not yet provide persistence; this may be changed in a future version. 
+Rate-limiting state is kept in memory, expired entries are cleaned up 
+automatically, and you can optionally cap the number of tracked IPs 
+(see [Bounding memory use](#bounding-memory-use)).
  
 # Quickstart
  
@@ -31,6 +33,11 @@ let partner_routes_rate_limit = RateLimitConfig::max_per_minute(100);
 
 // Limit: 10 requests per 20 Earth seconds
 let static_route_limit = RateLimitConfig::max_per_window(10,20);
+
+// Limit: 100 requests per 60 Earth seconds, tracking at most
+// 10,000 client IPs at a time (bounds memory use)
+let bounded_rate_limit = RateLimitConfig::max_per_minute(100)
+    .with_max_tracked_ips(10_000);
 ```
 
 3. Add the rate-limiting `Filter` to your route, which exposes 
@@ -43,8 +50,7 @@ let my_route = warp::path!("some_ratelimited_route")
     .and(with_rate_limit(public_routes_rate_limit.clone()))
     // - - -- --- ----- -------- ------------- ---------------------
     .and_then(your_request_handler)
-    .recover(your_rejection_handler)
-
+    .recover(your_rejection_handler);
 ```
 
 4. Use the `RateLimitInfo` data in your request handler. If you don't want 
@@ -91,7 +97,7 @@ async fn your_rejection_handler(rejection: Rejection) -> Result<impl Reply, Infa
         ).into_response();
 
         // Then, add the rate-limiting headers to that response:
-        let _ = add_rate_limit_headers(response.headers_mut(), &rate_limit_info);
+        let _ = add_rate_limit_headers(response.headers_mut(), &info);
 
         Ok(response)    
 
@@ -112,6 +118,33 @@ async fn your_rejection_handler(rejection: Rejection) -> Result<impl Reply, Infa
 | `RateLimitConfig::default()` | Max requests: 60/minute |
 | `RateLimitConfig::max_per_minute(x:u32)` | Max requests: `x`/minute |
 | `RateLimitConfig::max_per_window(max:u32,window:u64)` | Max requests: `max`/`window` (in seconds) |
+| `.with_max_tracked_ips(max:usize)` | Chainable; track at most `max` IPs at a time |
+
+A `max_requests` of `0` rejects every request. In that case no per-IP state 
+is stored at all, since request history can never change the outcome.
+
+## Bounding memory use
+
+Rate-limiting state is kept in an in-memory map keyed by client IP. 
+To prevent growing unbounded, once per window any entries with elapsed windows 
+will be cleaned up. The map only holds IPs seen within roughly the last two windows.
+
+You can set a hard cap on the number of IPs tracked at once, which is 
+useful in memory-constrained environments:
+
+  ```rust
+  // Never track more than 10,000 IPs (roughly 1-2 MB of state)
+  let config = RateLimitConfig::max_per_minute(100)
+      .with_max_tracked_ips(10_000);
+  ```
+
+When the cap is reached and a request arrives from a new IP, expired entries 
+are discarded first. If the map is still full, the entry closest to the end 
+of its window (the one that would have expired soonest) is removed to make 
+room for the new entry. This means that an evicted IP that returns will start a fresh 
+window, so a cap that is small relative to your number of concurrent clients may 
+weaken enforcement. It is recommended that you size the cap to comfortably exceed 
+the number of distinct client IPs you expect within one window.
 
 ## Reference
 
@@ -139,6 +172,10 @@ x-ratelimit-limit: 100
 x-ratelimit-remaining: 0
 x-ratelimit-reset: 1704067260
 ```
+
+`retry-after` and `x-ratelimit-reset` reflect the end of the requesting 
+client's *current* window -- including when you add these headers to 
+successful responses -- not a full window from the time of the response.
 
 ## Error handling
 
